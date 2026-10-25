@@ -16,7 +16,11 @@ Type a place ("Ballard, Seattle, WA") and the app:
   4. sorts everything into newsletter sections (events, council, schools, police & fire,
      real estate, business, obituaries, community, weather, other news),
   5. optional: Claude ranks every item for this neighbourhood and writes a one-line blurb
-     using only the item's own title and summary.
+     using only the item's own title and summary,
+  6. locality filter: keeps only items provably about the place — a location inside its
+     OpenStreetMap boundary, a street address that maps inside it, or naming the place or a
+     landmark inside it (reading the article when the headline doesn't say) — and lays them
+     out as a newsletter. The first-pass results stay available unchanged.
 
 Run
 ---
@@ -80,6 +84,7 @@ RANKING_MODEL = "claude-haiku-5-5"
 WEB_SEARCH_TOOL = "web_search_20250305"
 TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 MIN_SECONDS_PER_HOST = 0.75
+HOST_INTERVALS = {"nominatim.openstreetmap.org": 1.1, "overpass-api.de": 2.0}  # their usage policies
 DO_NOT_SCRAPE = (
     "facebook.com", "nextdoor.com", "instagram.com", "x.com", "twitter.com",
     "reddit.com", "tiktok.com", "legacy.com",
@@ -131,6 +136,7 @@ class Source:
     notes: str = ""
     status: str = "not fetched"
     n_items: int = 0
+    jurisdiction: str = ""      # the government this source belongs to (e.g. "Seattle")
 
 
 @dataclass
@@ -148,6 +154,13 @@ class Item:
     found_by: str = ""                      # feed | calendar | structured data | sitemap | page link | api | news search
     score: int | None = None
     blurb: str = ""
+    lat: float | None = None
+    lon: float | None = None
+    jurisdiction: str = ""
+    body: str = ""                          # article text fetched only for the locality check (not shown)
+    local: bool | None = None
+    local_why: str = ""
+    local_tier: str = ""                    # coordinates | address | name | landmark | jurisdiction | search match
 
 
 # --------------------------------------------------------------------------------------
@@ -166,7 +179,7 @@ def _pace(url: str) -> None:
     with _pace_lock:
         now = time.monotonic()
         slot = max(now, _next_slot.get(host, 0.0))
-        _next_slot[host] = slot + MIN_SECONDS_PER_HOST
+        _next_slot[host] = slot + HOST_INTERVALS.get(host, MIN_SECONDS_PER_HOST)
     if slot > now:
         time.sleep(slot - now)
 
@@ -289,12 +302,18 @@ def classify(item: Item, hint: str) -> str:
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocode(query: str, contact: str) -> dict | None:
     r = http_get("https://nominatim.openstreetmap.org/search", contact,
-                 params={"q": query, "format": "jsonv2", "addressdetails": 1, "limit": 1, "countrycodes": "us"})
+                 params={"q": query, "format": "jsonv2", "addressdetails": 1, "namedetails": 1, "limit": 1,
+                         "countrycodes": "us", "polygon_geojson": 1, "polygon_threshold": 0.0002})
     r.raise_for_status()
     hits = r.json()
     if not hits:
         return None
     hit, a = hits[0], hits[0].get("address", {})
+    shape = hit.get("geojson") or {}
+    names = hit.get("namedetails") or {}
+    aliases = sorted({v for k, v in names.items()
+                      if k in ("name", "name:en", "alt_name", "old_name", "short_name", "official_name")
+                      and isinstance(v, str) and len(v) >= 3})
     place = {
         "query": query, "display": hit.get("display_name", query),
         "lat": float(hit["lat"]), "lon": float(hit["lon"]),
@@ -302,6 +321,8 @@ def geocode(query: str, contact: str) -> dict | None:
         "city": a.get("city") or a.get("town") or a.get("village") or a.get("hamlet"),
         "county": a.get("county"), "state": a.get("state"),
         "state_code": (a.get("ISO3166-2-lvl4") or "").replace("US-", ""), "postcode": a.get("postcode"),
+        "boundary": shape if shape.get("type") in ("Polygon", "MultiPolygon") else None,
+        "aliases": aliases,
     }
     place["label"] = place["neighbourhood"] or place["city"] or place["county"] or query
     return place
@@ -383,7 +404,8 @@ def registry_for(place: dict) -> list[Source]:
                     date_fields=["inspection_date"], extra_fields=["inspection_result", "inspection_score"]),
             Source(name="Seattle City Council meetings (Legistar)", url="https://seattle.legistar.com/",
                    category="civic", method="api", fetcher="legistar", params={"client": "seattle"},
-                   notes="Some Legistar clients need an API token; an error here means ask the clerk."),
+                   notes="Some Legistar clients need an API token; an error here means ask the clerk.",
+                   jurisdiction="Seattle"),
             Source(name="Seattle Public Library events", url="https://www.spl.org/event-calendar",
                    category="events", method="web"),
             Source(name="The Seattle Times — Local", url="https://www.seattletimes.com/seattle-news/",
@@ -397,14 +419,16 @@ def registry_for(place: dict) -> list[Source]:
             Source(name="City of Bainbridge Island — council & planning (CivicClerk)",
                    url="https://bainbridgeislandwa.portal.civicclerk.com/", category="civic",
                    method="api", fetcher="civicclerk", params={"tenant": "bainbridgeislandwa"},
-                   notes="Public CivicClerk API (undocumented by the vendor; keep volume low)."),
+                   notes="Public CivicClerk API (undocumented by the vendor; keep volume low).",
+                   jurisdiction="Bainbridge Island"),
             Source(name="Bainbridge Island School District board (BoardDocs)",
                    url="https://go.boarddocs.com/wa/bisd/Board.nsf", category="schools", method="listed",
                    notes="No public API — agendas are HTML/PDF."),
         ]
     if county == "king county":
         out.append(Source(name="King County Council meetings (Legistar)", url="https://mkcclegisearch.kingcounty.gov/",
-                          category="civic", method="api", fetcher="legistar", params={"client": "kingcounty"}))
+                          category="civic", method="api", fetcher="legistar", params={"client": "kingcounty"},
+                          jurisdiction="King County"))
     if county == "kitsap county":
         out += [
             Source(name="Kitsap Sheriff — booked in last 72 hours",
@@ -592,6 +616,18 @@ def _place_text(loc) -> str:
     return ""
 
 
+def _geo(loc) -> tuple[float | None, float | None]:
+    if isinstance(loc, list):
+        loc = loc[0] if loc else {}
+    geo = loc.get("geo") if isinstance(loc, dict) else None
+    if isinstance(geo, dict):
+        try:
+            return float(geo["latitude"]), float(geo["longitude"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return None, None
+
+
 def items_from_structured_data(page_html: str, src: Source, page_url: str, tz: str, found_by: str) -> list[Item]:
     out = []
     for obj in _ld_objects(page_html):
@@ -602,9 +638,11 @@ def items_from_structured_data(page_html: str, src: Source, page_url: str, tz: s
             name = clean(str(obj.get("name", "")), 220)
             if not name:
                 continue
+            lat, lon = _geo(obj.get("location"))
             out.append(Item(source=src.name, section="events", title=name, url=url,
                             starts=parse_date(obj.get("startDate"), tz), where=clean(_place_text(obj.get("location")), 160),
-                            summary=clean(str(obj.get("description", "")), 400), via=src.name, found_by=found_by))
+                            summary=clean(str(obj.get("description", "")), 400), via=src.name, found_by=found_by,
+                            lat=lat, lon=lon))
         elif _ARTICLE_TYPES.intersection(types):
             title = clean(str(obj.get("headline") or obj.get("name") or ""), 220)
             if not title or url.rstrip("/") == src.url.rstrip("/"):
@@ -752,6 +790,19 @@ def item_from_page(url: str, src: Source, contact: str, tz: str, want_text: bool
                  summary=clean(desc, 400), text=text, via=src.name, found_by=found_by)]
 
 
+def extract_full_text(url: str, contact: str) -> str:
+    """Main article text of a page (robots.txt respected). Empty string when not allowed or not found."""
+    if trafilatura is None or is_blocked(url) or not url.startswith("http") or not robots_allows(url, contact):
+        return ""
+    try:
+        r = http_get(url, contact)
+    except httpx.HTTPError:
+        return ""
+    if r.status_code >= 400 or "html" not in r.headers.get("content-type", "html"):
+        return ""
+    return (trafilatura.extract(r.text, url=str(r.url), include_comments=False) or "")[:8000]
+
+
 def crawl_site(src: Source, contact: str, cutoff: dt.datetime, opts: dict) -> list[Item]:
     tz = opts["tz"]
     items: list[Item] = []
@@ -854,12 +905,13 @@ def api_socrata_geo(src, place, contact, cutoff, opts):
     titles = p.get("title_fields") or [c for c in cols if re.search(r"type|description|name", c)]
     out = []
     for row in r.json():
-        dist = None
+        dist = lat = lon = None
         if lat_col and lon_col:
             try:
-                dist = km_between(place["lat"], place["lon"], float(row[lat_col]), float(row[lon_col]))
+                lat, lon = float(row[lat_col]), float(row[lon_col])
+                dist = km_between(place["lat"], place["lon"], lat, lon)
             except (KeyError, TypeError, ValueError):
-                dist = None
+                dist = lat = lon = None
         if not server_geo and (dist is None or dist > opts["radius_km"]):
             continue
         address = pick(row, p.get("address_fields", []))
@@ -868,7 +920,8 @@ def api_socrata_geo(src, place, contact, cutoff, opts):
         out.append(Item(source=src.name, section=src.category,
                         title=" — ".join(b for b in (pick(row, titles, "Record"), address) if b),
                         url=src.url, published=parse_date(row.get(date_col), opts["tz"]) if date_col else None,
-                        summary=" · ".join(bits), via=src.name, found_by="api"))
+                        summary=" · ".join(bits), via=src.name, found_by="api", lat=lat, lon=lon,
+                        where=address))
         if len(out) >= opts["limit"]:
             break
     return out
@@ -965,6 +1018,7 @@ def fetch_source(src: Source, place: dict, contact: str, cutoff: dt.datetime, op
             continue
         seen.add(key)
         it.section = classify(it, src.category)
+        it.jurisdiction = src.jurisdiction
         kept.append(it)
     kept = kept[: opts["limit"]]
     src.n_items = len(kept)
@@ -1010,6 +1064,409 @@ Items:
             it.blurb = clean(str(r.get("blurb", "")), 200)
             done += 1
     return f"Claude ranked {done} of {len(items)} items."
+
+
+# --------------------------------------------------------------------------------------
+# Step 5 — locality filter: keep only items provably tied to the place
+# --------------------------------------------------------------------------------------
+_ADDRESS = re.compile(
+    r"\b\d{2,6}\s+(?:[NSEW]{1,2}\.?\s+)?(?:\d{1,3}(?:st|nd|rd|th)|[A-Za-z][A-Za-z'.]+)(?:\s+[A-Za-z][A-Za-z'.]+){0,3}?"
+    r"\s+(?:Ave(?:nue)?|St(?:reet)?|Rd|Road|Blvd|Boulevard|Way|Pl(?:ace)?|Dr(?:ive)?|Ln|Lane|Ct|Court|Pkwy|Parkway|"
+    r"Hwy|Highway|Ter(?:race)?|Cir(?:cle)?)\b\.?(?:\s+(?:NE|NW|SE|SW|N|S|E|W)\b)?", re.I)
+_GENERIC_LANDMARKS = {"park", "playground", "library", "school", "community center", "fire station",
+                      "police station", "garden", "museum", "marina", "elementary school", "high school"}
+
+
+def _in_ring(x: float, y: float, ring: list) -> bool:
+    inside = False
+    for i in range(len(ring)):
+        x1, y1 = ring[i][0], ring[i][1]
+        x2, y2 = ring[(i + 1) % len(ring)][0], ring[(i + 1) % len(ring)][1]
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / ((y2 - y1) or 1e-12) + x1:
+            inside = not inside
+    return inside
+
+
+def _in_shape(lon: float, lat: float, shape: dict) -> bool:
+    polys = [shape["coordinates"]] if shape["type"] == "Polygon" else shape["coordinates"]
+    return any(_in_ring(lon, lat, p[0]) and not any(_in_ring(lon, lat, h) for h in p[1:]) for p in polys)
+
+
+def inside_locality(lat: float, lon: float, place: dict, radius_km: float) -> bool:
+    """Inside the place's OpenStreetMap boundary, or within radius_km of its centre when there is none."""
+    if place.get("boundary"):
+        return _in_shape(lon, lat, place["boundary"])
+    return km_between(place["lat"], place["lon"], lat, lon) <= radius_km
+
+
+def _reach_m(place: dict, radius_km: float) -> int:
+    b = place.get("boundary")
+    if not b:
+        return int(radius_km * 1000)
+    polys = [b["coordinates"]] if b["type"] == "Polygon" else b["coordinates"]
+    far = max(km_between(place["lat"], place["lon"], pt[1], pt[0]) for p in polys for pt in p[0])
+    return int(min(far, 6.0) * 1000)
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def _overpass_names(lat: float, lon: float, reach_m: int, contact: str) -> list[tuple[str, float, float]]:
+    query = f"""[out:json][timeout:25];
+(
+  nwr(around:{reach_m},{lat},{lon})["name"]["amenity"~"^(school|college|library|community_centre|marketplace|theatre|arts_centre|townhall|cinema)$"];
+  nwr(around:{reach_m},{lat},{lon})["name"]["leisure"~"^(park|playground|sports_centre|stadium|marina|nature_reserve|garden)$"];
+  nwr(around:{reach_m},{lat},{lon})["name"]["tourism"~"^(attraction|museum|viewpoint)$"];
+  nwr(around:{reach_m},{lat},{lon})["name"]["place"~"^(neighbourhood|quarter|suburb|locality)$"];
+);
+out tags center 600;"""
+    r = http_get("https://overpass-api.de/api/interpreter", contact, params={"data": query})
+    r.raise_for_status()
+    out = []
+    for el in r.json().get("elements", []):
+        pt = el.get("center") or el
+        if "lat" in pt and "lon" in pt and el.get("tags", {}).get("name"):
+            out.append((el["tags"]["name"], float(pt["lat"]), float(pt["lon"])))
+    return out
+
+
+def landmarks_for(place: dict, contact: str, radius_km: float) -> list[str]:
+    """Named schools, parks, libraries, community centres etc. inside the place (OpenStreetMap)."""
+    city = (place.get("city") or "").lower()
+    names = set()
+    for name, lat, lon in _overpass_names(place["lat"], place["lon"], _reach_m(place, radius_km), contact):
+        n = name.strip()
+        if n.lower() in _GENERIC_LANDMARKS or n.lower() == city or (len(n) < 8 and " " not in n):
+            continue
+        if inside_locality(lat, lon, place, radius_km):
+            names.add(n)
+    return sorted(names)
+
+
+def name_pattern(names: list[str]) -> re.Pattern | None:
+    names = sorted({n.strip() for n in names if n and len(n.strip()) >= 3}, key=len, reverse=True)
+    if not names:
+        return None
+    alts = "|".join(re.escape(n).replace(r"\ ", r"[\s\-_]+") for n in names)
+    return re.compile(rf"(?<![A-Za-z])(?:{alts})(?![A-Za-z])", re.I)
+
+
+@functools.lru_cache(maxsize=4096)
+def geocode_address(address: str, city: str, state: str, lat: float, lon: float, contact: str):
+    """Look up a street address near the place (bounded box), returns (lat, lon) or None."""
+    box = f"{lon - 0.25},{lat + 0.25},{lon + 0.25},{lat - 0.25}"
+    try:
+        r = http_get("https://nominatim.openstreetmap.org/search", contact,
+                     params={"q": ", ".join(p for p in (address, city, state) if p), "format": "jsonv2",
+                             "limit": 1, "countrycodes": "us", "viewbox": box, "bounded": 1})
+        hits = r.json() if r.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        return None
+    return (float(hits[0]["lat"]), float(hits[0]["lon"])) if hits else None
+
+
+def item_text(it: Item) -> str:
+    path = urllib.parse.urlsplit(it.url).path
+    for ch in "-_/":
+        path = path.replace(ch, " ")
+    return " ".join([it.title, it.summary, it.where, it.blurb, it.text or it.body, path])
+
+
+def check_local(it: Item, place: dict, ctx: dict) -> tuple[bool | None, str, str]:
+    """(True, why, tier) if tied to the place; (False, why, '') if its location rules it out; (None, …) if undecided."""
+    label = place["label"]
+    if it.lat is not None and it.lon is not None:  # a location is decisive either way
+        if inside_locality(it.lat, it.lon, place, ctx["radius_km"]):
+            d = km_between(place["lat"], place["lon"], it.lat, it.lon)
+            return True, f"happens inside {label} ({d:.1f} km from the centre)", "coordinates"
+        return False, f"location is outside {label}", ""
+    if it.via == "National Weather Service alerts":
+        return True, f"weather alert covering {label}", "coordinates"
+    if it.jurisdiction and it.jurisdiction.lower() == label.lower():
+        return True, f"{it.jurisdiction}'s own government", "jurisdiction"
+    text = item_text(it)
+    if ctx["names"] is not None and (m := ctx["names"].search(text)):
+        return True, f"names “{m.group(0)}”", "name"
+    if ctx["marks"] is not None and (m := ctx["marks"].search(text)):
+        return True, f"mentions {m.group(0)}, which is in {label}", "landmark"
+    return None, "", ""
+
+
+def localize(items: list[Item], place: dict, contact: str, opts: dict, landmarks: list[str]) -> dict:
+    """Marks every item local or not, with the reason. Cheap checks first, then reads articles,
+    then looks up street addresses on the map."""
+    ctx = {"radius_km": opts["locality_km"],
+           "names": name_pattern([place["label"], *place.get("aliases", []), *opts["extra_names"]]),
+           "marks": name_pattern(landmarks)}
+    stats = collections.Counter()
+
+    def run(pending: list[Item]) -> list[Item]:
+        rest = []
+        for it in pending:
+            ok, why, tier = check_local(it, place, ctx)
+            if ok is None:
+                rest.append(it)
+                continue
+            it.local, it.local_why, it.local_tier = ok, why, tier
+            if ok:
+                stats[tier] += 1
+        return rest
+
+    for it in items:
+        it.local, it.local_why, it.local_tier = None, "", ""
+    pending = run(items)
+
+    # Read the article for items whose headline and summary don't settle it
+    to_read = [it for it in pending if it.found_by not in ("api", "news search")
+               and not (it.text or it.body)][: opts["body_checks"]]
+    if to_read:
+        with cf.ThreadPoolExecutor(max_workers=8) as pool:
+            for it, body in zip(to_read, pool.map(lambda i: extract_full_text(i.url, contact), to_read)):
+                it.body = body
+        stats["articles read"] = len(to_read)
+        pending = run(pending)
+
+    # Look up street addresses and keep the item if one falls inside the boundary
+    looked = 0
+    city, state = place.get("city") or place.get("county") or "", place.get("state") or ""
+    for it in pending:
+        if looked >= opts["address_checks"]:
+            break
+        for addr in dict.fromkeys(m.group(0).strip() for m in _ADDRESS.finditer(item_text(it))):
+            if looked >= opts["address_checks"]:
+                break
+            looked += 1
+            pt = geocode_address(addr, city, state, round(place["lat"], 4), round(place["lon"], 4), contact)
+            if pt and inside_locality(pt[0], pt[1], place, opts["locality_km"]):
+                it.local, it.local_why, it.local_tier = True, f"address {addr} is inside {place['label']}", "address"
+                stats["address"] += 1
+                break
+    stats["addresses looked up"] = looked
+
+    for it in items:
+        if it.local is None and opts["trust_search"] and it.found_by == "news search":
+            it.local, it.local_tier = True, "search match"
+            it.local_why = f"news search for “{place['label']}” (not checked in the article)"
+            stats["search match"] += 1
+        if it.local is None:
+            it.local = False
+            it.local_why = "doesn't name the place, a landmark in it, or an address or location inside it"
+    stats["kept"] = sum(1 for i in items if i.local)
+    stats["checked"] = len(items)
+    return dict(stats)
+
+
+# --------------------------------------------------------------------------------------
+# Step 6 — the newsletter view
+# --------------------------------------------------------------------------------------
+NEWSLETTER_CSS = """
+<style>
+.nb{max-width:760px;margin:0 auto;background:#fffdf8;color:#1f2328;border:1px solid #e7e2d6;border-radius:14px;
+    padding:32px 36px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.5}
+.nb a{color:#1f2328;text-decoration:none;border-bottom:1px solid #d9c9a3}
+.nb a:hover{color:#b45309;border-color:#b45309}
+.nb-kicker{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#b45309;font-weight:600}
+.nb h1{font-family:Georgia,"Times New Roman",serif;font-size:34px;line-height:1.15;margin:6px 0 4px;color:#1f2328}
+.nb-date{color:#6b7280;font-size:14px}
+.nb-intro{font-size:16px;margin:18px 0 8px;padding-bottom:18px;border-bottom:2px solid #1f2328}
+.nb h2{font-family:Georgia,"Times New Roman",serif;font-size:22px;margin:28px 0 10px;padding-bottom:6px;
+       border-bottom:1px solid #e7e2d6;color:#1f2328}
+.nb-alert{background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:10px 14px;margin:14px 0;font-size:14px}
+.nb-day{font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;margin:14px 0 4px}
+.nb-ev{display:flex;gap:14px;padding:8px 0;border-bottom:1px dashed #ece6d8}
+.nb-time{min-width:64px;font-variant-numeric:tabular-nums;color:#b45309;font-weight:600;font-size:14px}
+.nb-story{padding:10px 0 12px;border-bottom:1px dashed #ece6d8}
+.nb-head{font-family:Georgia,"Times New Roman",serif;font-size:18px;font-weight:600}
+.nb-story p{margin:4px 0 6px;font-size:15px}
+.nb-meta{font-size:12.5px;color:#6b7280}
+.nb-why{display:inline-block;font-size:11.5px;background:#f1ece0;color:#5b4a26;border-radius:999px;padding:1px 8px;margin-left:4px}
+.nb-blotter{list-style:none;padding:0;margin:0}
+.nb-blotter li{padding:5px 0;border-bottom:1px dashed #ece6d8;font-size:14px}
+.nb-more{font-size:13px;color:#6b7280;margin-top:6px}
+.nb-foot{margin-top:28px;padding-top:14px;border-top:2px solid #1f2328;font-size:12.5px;color:#6b7280}
+.nb-empty{color:#6b7280;font-style:italic}
+</style>"""
+
+NEWSLETTER_ORDER = ["civic", "schools", "community", "business", "real_estate", "public_safety", "obituaries", "news"]
+
+
+@dataclass
+class Entry:
+    """One line in the newsletter: the best copy of a headline, plus what was merged into it."""
+    item: Item
+    count: int = 1
+    also_sources: list = field(default_factory=list)
+    also_starts: list = field(default_factory=list)
+    title: str = ""   # best-formatted wording of the headline across the merged copies
+
+    def __post_init__(self):
+        self.title = self.title or self.item.title
+
+
+_TIER_RANK = {"coordinates": 6, "address": 5, "name": 4, "landmark": 3, "jurisdiction": 2, "search match": 1}
+_PUNCT = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"',
+                        "–": "-", "—": "-", " ": " "})
+
+
+def headline_key(it: Item) -> str:
+    """The headline as text, ignoring case, spacing, quote/dash styles and a trailing ' - Publisher'."""
+    t = it.title or ""
+    src = (it.source or "").strip()
+    if src and t.lower().endswith(" - " + src.lower()):
+        t = t[: -(len(src) + 3)]
+    t = re.sub(r"\s+", " ", t.translate(_PUNCT).lower())
+    return t.strip(" .!?:;-'\"")
+
+
+def dedupe_for_newsletter(items: list[Item], tz: str) -> tuple[list[Entry], int]:
+    """Collapse items whose headlines are exactly the same. Returns the entries and how many were merged."""
+    zone = ZoneInfo(tz)
+    epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    groups: dict[str, list[Item]] = {}
+    for it in items:
+        groups.setdefault(headline_key(it), []).append(it)
+
+    def quality(i: Item):
+        return (_TIER_RANK.get(i.local_tier, 0), i.found_by != "news search", bool(i.published or i.starts),
+                len(i.blurb or i.summary), i.score or 0)
+
+    entries, merged = [], 0
+    for key, grp in groups.items():
+        if not key or len(grp) == 1:
+            entries.extend(Entry(i) for i in grp)
+            continue
+        dated = [i for i in grp if i.starts]
+        if dated:  # an event: show it once, at its next date
+            best = min(dated, key=lambda i: (i.starts, -_TIER_RANK.get(i.local_tier, 0)))
+            first_day = best.starts.astimezone(zone).date()
+            others = sorted({i.starts.astimezone(zone).date() for i in dated} - {first_day})
+            also_starts = [dt.datetime(d.year, d.month, d.day, tzinfo=zone) for d in others]
+        elif all(i.section == "public_safety" for i in grp):  # repeat calls: show once with the latest time
+            best, also_starts = max(grp, key=lambda i: i.published or epoch), []
+        else:
+            best, also_starts = max(grp, key=quality), []
+        wordings = []
+        for i in grp:
+            t, src = i.title.strip(), (i.source or "").strip()
+            if src and t.lower().endswith(" - " + src.lower()):
+                t = t[: -(len(src) + 3)].strip()
+            wordings.append(re.sub(r"\s+", " ", t))
+        title = max(wordings, key=lambda t: (t[:1].isupper(), sum(c.isupper() for c in t), -len(t)))
+        entries.append(Entry(best, count=len(grp), also_starts=also_starts, title=title,
+                             also_sources=sorted({i.source for i in grp if i.source and i.source != best.source})))
+        merged += len(grp) - 1
+    return entries, merged
+
+
+def _href(url: str) -> str:
+    return html.escape(url, quote=True) if url.startswith(("http://", "https://")) else "#"
+
+
+def build_newsletter(place: dict, items: list[Item], tz: str, days: int, days_ahead: int, stats: dict) -> str:
+    e = html.escape
+    label = place["label"]
+    zone = ZoneInfo(tz)
+    today = dt.datetime.now(zone)
+    entries, merged = dedupe_for_newsletter([i for i in items if i.local], tz)
+    far = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    weather = [en for en in entries if en.item.section == "weather"]
+    events = sorted((en for en in entries if en.item.section == "events"), key=lambda en: en.item.starts or far)
+    stories = {s: sorted((en for en in entries if en.item.section == s),
+                         key=lambda en: (en.item.score or 0, en.item.published or epoch), reverse=True)
+               for s in NEWSLETTER_ORDER}
+    n_stories = sum(len(v) for k, v in stories.items() if k != "public_safety")
+
+    def why(it: Item) -> str:
+        return f'<span class="nb-why">{e(it.local_why)}</span>' if it.local_why else ""
+
+    def also(en: Entry) -> str:
+        bits = []
+        if en.also_starts:
+            dates = ", ".join(f"{d:%a} {d.day} {d:%b}" for d in en.also_starts[:4])
+            bits.append(f"also {dates}" + (" and more" if len(en.also_starts) > 4 else ""))
+        if en.also_sources:
+            bits.append("also from " + ", ".join(en.also_sources[:3]) +
+                        (f" +{len(en.also_sources) - 3}" if len(en.also_sources) > 3 else ""))
+        return f" · {e('; '.join(bits))}" if bits else ""
+
+    out = [NEWSLETTER_CSS, '<div class="nb">',
+           f'<div class="nb-kicker">Newsbee · {e(label)}</div>',
+           f"<h1>This week in {e(label)}</h1>",
+           f'<div class="nb-date">{today:%A %d %B %Y} · news from the last {days} days, '
+           f"events for the next {days_ahead}</div>"]
+    bits = [f"{len(events)} thing{'s' if len(events) != 1 else ''} to do", f"{n_stories} local stor{'ies' if n_stories != 1 else 'y'}"]
+    if stories["public_safety"]:
+        bits.append(f"{len(stories['public_safety'])} police & fire calls nearby")
+    out.append(f'<p class="nb-intro">Here’s what’s happening in {e(label)}: {", ".join(bits)}. '
+               f"Everything below is tied to {e(label)} by where it happens, an address inside it, or by naming it.</p>")
+
+    for w in (en.item for en in weather[:3]):
+        out.append(f'<div class="nb-alert"><b>⚠ {e(w.title)}</b> — {e(clean(w.summary, 200))}</div>')
+
+    out.append("<h2>Coming up</h2>")
+    if not events:
+        out.append('<p class="nb-empty">No upcoming events found for this place yet.</p>')
+    last_day = None
+    for en in events[:25]:
+        ev = en.item
+        when = ev.starts.astimezone(zone) if ev.starts else None
+        day = when.strftime("%A %d %B") if when else "Date not listed — check the link"
+        if day != last_day:
+            out.append(f'<div class="nb-day">{e(day)}</div>')
+            last_day = day
+        if not when:
+            t = "—"
+        elif when.hour or when.minute:
+            t = when.strftime("%I:%M %p").lstrip("0").lower()
+        else:
+            t = "All day"
+        meta = " · ".join(x for x in (ev.where, ev.source) if x)
+        out.append(f'<div class="nb-ev"><div class="nb-time">{e(t)}</div><div>'
+                   f'<a href="{_href(ev.url)}" target="_blank">{e(en.title)}</a>'
+                   f'<div class="nb-meta">{e(meta)}{also(en)} {why(ev)}</div></div></div>')
+    if len(events) > 25:
+        out.append(f'<div class="nb-more">…and {len(events) - 25} more events.</div>')
+
+    for s in NEWSLETTER_ORDER:
+        lst = stories[s]
+        if not lst:
+            continue
+        out.append(f"<h2>{e(SECTIONS[s])}</h2>")
+        if s == "public_safety":
+            out.append('<ul class="nb-blotter">')
+            for en in lst[:12]:
+                it = en.item
+                when = it.published.astimezone(zone).strftime("%a %I:%M %p").replace(" 0", " ") if it.published else ""
+                calls = f"{en.count} calls, latest {when}" if en.count > 1 else when
+                out.append(f"<li><b>{e(en.title)}</b> · {e(calls)} {why(it)}</li>")
+            out.append("</ul>")
+            if len(lst) > 12:
+                out.append(f'<div class="nb-more">…and {len(lst) - 12} more calls.</div>')
+            continue
+        for en in lst[:8]:
+            it = en.item
+            when = it.published.astimezone(zone).strftime("%d %b") if it.published else ""
+            text = it.blurb or clean(it.summary, 240)
+            meta = " · ".join(x for x in (it.source, when) if x)
+            out.append(f'<div class="nb-story"><a class="nb-head" href="{_href(it.url)}" target="_blank">{e(en.title)}</a>'
+                       + (f"<p>{e(text)}</p>" if text else "")
+                       + f'<div class="nb-meta">{e(meta)}{also(en)} {why(it)}</div></div>')
+        if len(lst) > 8:
+            out.append(f'<div class="nb-more">…and {len(lst) - 8} more in {e(SECTIONS[s].lower())}.</div>')
+
+    dup_note = (f" {merged} repeated headline{'s were' if merged != 1 else ' was'} merged so each appears once."
+                if merged else "")
+    out.append(f'<div class="nb-foot">Made by Newsbee from public sources. {stats.get("kept", 0)} of '
+               f'{stats.get("checked", 0)} items found passed the {e(label)} check.{dup_note} Headlines link to the '
+               f"original publishers; read the full stories there.</div></div>")
+    return "\n".join(out)
+
+
+def newsletter_document(place: dict, body: str) -> str:
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f"<title>This week in {html.escape(place['label'])}</title></head>"
+            f'<body style="background:#f4f1ea;margin:0;padding:24px 12px">{body}</body></html>')
 
 
 # --------------------------------------------------------------------------------------
@@ -1089,6 +1546,19 @@ def main() -> None:
         st.header("Ranking")
         use_ai_rank = st.checkbox("Rank & blurb items with Claude", can_ai, disabled=not can_ai)
         rank_model = st.text_input("Ranking model", RANKING_MODEL, disabled=not use_ai_rank)
+
+        st.header("Locality filter")
+        extra_names = st.text_input("Other names for this place (comma-separated)", "",
+                                    help="Spellings and nicknames people use, e.g. Wedgewood, Old Ballard.")
+        use_landmarks = st.checkbox("Match landmarks inside the place (parks, schools, libraries)", True,
+                                    help="Named places inside the boundary, from OpenStreetMap.")
+        locality_km = st.slider("Radius if no boundary is found (km)", 0.3, 5.0, 1.2, 0.1,
+                                help="Used only when OpenStreetMap has no boundary shape for the place.")
+        body_checks = st.slider("Articles to open and check for the place name", 0, 80, 30,
+                                help="For items whose headline and summary don't mention the place.")
+        address_checks = st.slider("Street addresses to look up on the map", 0, 60, 20,
+                                   help="OpenStreetMap allows about one lookup per second.")
+        trust_search = st.checkbox("Also keep news-search hits not confirmed in the article", False)
         go = st.button("Find everything", type="primary", use_container_width=True)
 
     if go:
@@ -1146,8 +1616,22 @@ def main() -> None:
                 except Exception as e:
                     notes.append(f"Ranking failed: {type(e).__name__}: {str(e)[:150]}")
 
-        st.session_state["result"] = {"place": place, "sources": sources, "items": items,
-                                      "notes": notes, "tz": tz}
+        marks: list[str] = []
+        if use_landmarks:
+            with st.spinner("Listing landmarks inside the place…"):
+                try:
+                    marks = landmarks_for(place, contact, locality_km)
+                except Exception as e:
+                    notes.append(f"Landmark lookup skipped: {type(e).__name__}: {str(e)[:120]}")
+        lopts = {"locality_km": locality_km, "body_checks": body_checks, "address_checks": address_checks,
+                 "trust_search": trust_search,
+                 "extra_names": [n.strip() for n in extra_names.split(",") if n.strip()]}
+        with st.spinner(f"Checking which items are really about {place['label']}…"):
+            lstats = localize(items, place, contact, lopts, marks)
+
+        st.session_state["result"] = {"place": place, "sources": sources, "items": items, "notes": notes,
+                                      "tz": tz, "lstats": lstats, "landmarks": marks,
+                                      "days": days, "days_ahead": days_ahead}
 
     result = st.session_state.get("result")
     if not result:
@@ -1155,21 +1639,47 @@ def main() -> None:
         return
 
     place, sources, items, tz = result["place"], result["sources"], result["items"], result["tz"]
+    lstats = result.get("lstats", {})
+    local_items = [i for i in items if i.local]
     left, right = st.columns([2, 1])
     with left:
         st.subheader(place["label"])
-        st.caption(place["display"])
+        st.caption(place["display"] + (" · boundary from OpenStreetMap" if place.get("boundary")
+                                       else " · no boundary found, using the radius"))
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Sources", len(sources))
         m2.metric("Sources with items", sum(1 for s in sources if s.n_items))
-        m3.metric("Items", len(items))
-        m4.metric("Upcoming events", sum(1 for i in items if i.section == "events"))
+        m3.metric("Items found", len(items))
+        m4.metric(f"About {place['label']}", len(local_items))
         for n in result["notes"]:
             st.caption(n)
     with right:
-        st.map(pd.DataFrame({"lat": [place["lat"]], "lon": [place["lon"]]}), zoom=12)
+        pts = [{"lat": place["lat"], "lon": place["lon"]}] + \
+              [{"lat": i.lat, "lon": i.lon} for i in local_items if i.lat is not None and i.lon is not None]
+        st.map(pd.DataFrame(pts), zoom=13)
 
-    tab_items, tab_sources, tab_export = st.tabs(["Newsletter items", "Sources", "Export"])
+    tab_local, tab_items, tab_sources, tab_export = st.tabs(
+        [f"Local newsletter ({len(local_items)})", f"All items, first pass ({len(items)})", "Sources", "Export"])
+
+    with tab_local:
+        if lstats:
+            tiers = [("coordinates", "location inside"), ("address", "address inside"), ("name", "names the place"),
+                     ("landmark", "names a landmark"), ("jurisdiction", "own government"),
+                     ("search match", "search match")]
+            _, merged = dedupe_for_newsletter(local_items, tz)
+            st.caption("Why items were kept: " + " · ".join(f"{label} {lstats[k]}" for k, label in tiers if lstats.get(k))
+                       + f"  |  articles read: {lstats.get('articles read', 0)}"
+                       + f" · addresses looked up: {lstats.get('addresses looked up', 0)}"
+                       + f" · repeated headlines merged: {merged}")
+        st.html(build_newsletter(place, items, tz, result.get("days", 7), result.get("days_ahead", 30), lstats))
+        dropped = [i for i in items if i.local is False]
+        with st.expander(f"Left out ({len(dropped)}) — and why"):
+            st.dataframe(pd.DataFrame([{"Item": i.title, "Source": i.source, "Section": SECTIONS.get(i.section, i.section),
+                                        "Reason": i.local_why, "Link": i.url} for i in dropped]),
+                         hide_index=True, column_config={"Link": st.column_config.LinkColumn("Link")})
+        if result.get("landmarks"):
+            with st.expander(f"Landmarks used to recognise {place['label']} ({len(result['landmarks'])})"):
+                st.write(", ".join(result["landmarks"]))
 
     with tab_items:
         if not items:
@@ -1214,11 +1724,21 @@ def main() -> None:
             "Link": st.column_config.LinkColumn("Link"), "Feed": st.column_config.LinkColumn("Feed")})
 
     with tab_export:
-        rows = [{**asdict(i), "section": SECTIONS.get(i.section, i.section),
-                 "published": i.published.isoformat() if i.published else "",
-                 "starts": i.starts.isoformat() if i.starts else ""} for i in items]
+        def table(lst: list[Item]) -> str:
+            rows = [{**{k: v for k, v in asdict(i).items() if k != "body"},
+                     "section": SECTIONS.get(i.section, i.section),
+                     "published": i.published.isoformat() if i.published else "",
+                     "starts": i.starts.isoformat() if i.starts else ""} for i in lst]
+            return pd.DataFrame(rows).to_csv(index=False)
+
         label = place["label"].replace(" ", "_")
-        st.download_button("Download all items (CSV)", pd.DataFrame(rows).to_csv(index=False),
+        page = newsletter_document(place, build_newsletter(place, items, tz, result.get("days", 7),
+                                                           result.get("days_ahead", 30), lstats))
+        st.download_button(f"Download the {place['label']} newsletter (HTML)", page,
+                           file_name=f"newsbee_{label}.html", mime="text/html")
+        st.download_button(f"Download items about {place['label']} (CSV)", table(local_items),
+                           file_name=f"newsbee_local_items_{label}.csv", mime="text/csv")
+        st.download_button("Download all items, first pass (CSV)", table(items),
                            file_name=f"newsbee_items_{label}.csv", mime="text/csv")
         st.download_button("Download source map (JSON)", json.dumps([asdict(s) for s in sources], indent=2),
                            file_name=f"newsbee_sources_{label}.json", mime="application/json")
