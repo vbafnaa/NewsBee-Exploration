@@ -1,0 +1,7 @@
+streamlit>=1.40
+httpx>=0.27
+feedparser>=6.0
+pandas>=2.0
+trafilatura>=1.12   # article titles, dates and full text from web pages
+icalendar>=5.0      # event calendars (.ics)
+anthropic>=0.60     # optional: Claude source discovery and ranking
