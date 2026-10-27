@@ -54,6 +54,7 @@ import email.utils
 import fnmatch
 import functools
 import html
+import io
 import json
 import math
 import os
@@ -82,6 +83,10 @@ try:
     import anthropic
 except ImportError:
     anthropic = None
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
 
 
 # --------------------------------------------------------------------------------------
@@ -93,7 +98,10 @@ RANKING_MODEL = "claude-haiku-5-5"
 WEB_SEARCH_TOOL = "web_search_20250305"
 TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 MIN_SECONDS_PER_HOST = 0.75
-HOST_INTERVALS = {"nominatim.openstreetmap.org": 1.1, "overpass-api.de": 2.0}  # their usage policies
+HOST_INTERVALS = {"nominatim.openstreetmap.org": 1.1, "overpass-api.de": 2.0,   # their usage policies
+                  "overpass.kumi.systems": 2.0}
+SLOW_HOSTS = {"overpass-api.de": 90.0, "overpass.kumi.systems": 90.0}           # long-running queries
+OVERPASS_ENDPOINTS = ("https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter")
 DO_NOT_SCRAPE = (
     "facebook.com", "nextdoor.com", "instagram.com", "x.com", "twitter.com",
     "reddit.com", "tiktok.com", "legacy.com",
@@ -176,6 +184,7 @@ class Item:
     local_tier: str = ""                    # coordinates | address | name | landmark | jurisdiction | search match
     use: str = ""                           # how Newsbee may use it: public record | their writing | headline & link only
     map_url: str = ""                       # police & fire: a map pin for where it happened
+    attachments: list = field(default_factory=list)   # [(name, url)] agendas, minutes, staff reports (PDFs)
 
 
 # --------------------------------------------------------------------------------------
@@ -211,7 +220,9 @@ def http_get(url: str, contact: str, params: dict | None = None, accept: str | N
     headers = {"User-Agent": user_agent(contact)}
     if accept:
         headers["Accept"] = accept
-    return httpx.get(url, params=params, headers=headers, timeout=TIMEOUT, follow_redirects=True)
+    slow = SLOW_HOSTS.get(_host(url))
+    timeout = httpx.Timeout(slow, connect=15.0) if slow else TIMEOUT
+    return httpx.get(url, params=params, headers=headers, timeout=timeout, follow_redirects=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -530,6 +541,12 @@ def classify(item: Item, hint: str) -> str:
     everything else is sorted by keywords."""
     if item.found_by == "api" or hint in ("public_safety", "weather"):
         return hint
+    if item.found_by in ("agenda", "document"):   # government business: council, or the topic it is about
+        full = item.summary.split("Full title:", 1)[1] if "Full title:" in item.summary else ""
+        for section, rx in _SECTION_RES:
+            if section in ("real_estate", "schools", "business") and rx.search(f"{item.title} {full}"):
+                return section
+        return "civic"
     if item.starts:
         return "events"
     path = urllib.parse.urlsplit(item.url).path.replace("-", " ").replace("/", " ")
@@ -829,6 +846,28 @@ def government_site_sources(level: str, site: str, gov_name: str, contact: str) 
     out = [Source(name=label, url=site, category="civic", method="web", origin=f"{level} website",
                   jurisdiction=gov_name if level == "city" else "")]
     root = site.rstrip("/")
+    # Department newsrooms linked from the homepage (police blotter, fire news, press releases, notices)
+    try:
+        home = web_get(site, contact)
+        base = ".".join(_host(str(home.url)).split(".")[-2:])
+        rooms = {}
+        for href, text in _DOC_LINK.findall(home.text[:400_000]):
+            url = urllib.parse.urljoin(str(home.url), html.unescape(href)).split("#")[0]
+            label = clean(text, 80)
+            host = _host(url)
+            if not (host == base or host.endswith("." + base)) or url.rstrip("/") == site.rstrip("/"):
+                continue
+            if re.search(r"news|press|blotter|newsroom|media release|announcement|alerts?|public notice|blog", f"{label} {url}", re.I) \
+                    and not re.search(r"subscribe|signup|sign-up|login|facebook|twitter|instagram", url, re.I) \
+                    and url not in rooms.values() and len(rooms) < 5:
+                rooms[label or url] = url
+        for label, url in rooms.items():
+            cat = "public_safety" if re.search(r"police|fire|blotter|sheriff|emergency", f"{label} {url}", re.I) else "news"
+            out.append(Source(name=f"{gov_name} — {label}"[:90], url=url, category=cat, method="web",
+                              origin=f"{level} website", jurisdiction=out[0].jurisdiction,
+                              notes="Newsroom on the government's own site — a primary source."))
+    except httpx.HTTPError:
+        pass
     try:
         r = web_get(root + "/AgendaCenter", contact)
         if r.status_code == 200 and "agendacenter" in r.text.lower():
@@ -867,23 +906,35 @@ _OSM_KINDS = {  # tag value: (priority, newsletter section)
 def _overpass_websites(lat: float, lon: float, reach_m: int, contact: str) -> list[dict]:
     around = f"(around:{reach_m},{lat},{lon})"
     has_site = '[~"^(website|contact:website)$"~"."]'
-    query = f"""[out:json][timeout:25];
+    query = f"""[out:json][timeout:60];
 (
   nwr{around}["name"]["amenity"~"^(townhall|library|community_centre|marketplace|social_centre|school|college|arts_centre|theatre)$"]{has_site};
   nwr{around}["name"]["tourism"="museum"]{has_site};
   nwr{around}["name"]["office"~"^(government|association)$"]{has_site};
 );
 out tags center 400;"""
-    r = polite_get("https://overpass-api.de/api/interpreter", contact, params={"data": query})
-    r.raise_for_status()
     out = []
-    for el in r.json().get("elements", []):
+    for el in overpass(query, contact).get("elements", []):
         tags, pt = el.get("tags", {}), el.get("center") or el
         kind = tags.get("amenity") or (tags.get("tourism") if tags.get("tourism") == "museum" else tags.get("office"))
         site = _website(tags)
         if tags.get("name") and site and kind in _OSM_KINDS and "lat" in pt and "lon" in pt:
             out.append({"name": tags["name"], "url": site, "kind": kind, "lat": float(pt["lat"]), "lon": float(pt["lon"])})
     return out
+
+
+def overpass(query: str, contact: str) -> dict:
+    """Runs an Overpass query, falling back to a mirror if the main server is busy or times out."""
+    last = None
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            r = polite_get(endpoint, contact, params={"data": query})
+            if r.status_code == 200:
+                return r.json()
+            last = httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
+        except (httpx.HTTPError, ValueError) as e:
+            last = e
+    raise last or httpx.HTTPError("Overpass unavailable")
 
 
 def osm_sources(place: dict, contact: str, radius_km: float, cap: int) -> list[Source]:
@@ -970,15 +1021,33 @@ def meeting_software_sources(place: dict, contact: str) -> list[Source]:
 
 # Socrata open-data network (used by hundreds of US cities, counties and states)
 SOCRATA_CATALOG = "https://api.us.socrata.com/api/catalog/v1"
-SOCRATA_TOPICS = [  # (section, catalogue search, dataset-name rule)
-    ("public_safety", "police calls", r"police|crime|incident|calls? for service|offen[cs]e|dispatch"),
-    ("public_safety", "fire 911", r"fire|\bems\b|911|emergency"),
-    ("real_estate", "building permits", r"permit|construction|land use|zoning|development|building"),
-    ("business", "inspections", r"inspection|restaurant|food establishment"),
-    ("business", "business licenses", r"business licen|liquor|licen[cs]e appl|new business"),
-    ("civic", "311 service requests", r"\b311\b|service request|code (enforcement|violation|complaint)"),
+SOCRATA_TOPICS = [  # (section, catalogue search, dataset-name rule, names to avoid)
+    ("public_safety", "crime data", r"crime|offen[cs]e|incident report",
+     r"hate|use of force|officer|complaint|terry|stops?\b|arrests? by|summary|rate"),
+    ("public_safety", "police calls", r"police|calls? for service|call data|dispatch|\b911\b",
+     r"officer|use of force|complaint|stations?|boundar|beats?\b|budget|staff"),
+    ("public_safety", "fire 911", r"fire|\bems\b|911|emergency", r"stations?|hydrant|inspection|budget"),
+    ("real_estate", "building permits", r"permit",
+     r"right.of.way|street use|sign|tree|electrical|side ?sewer|trade|fees?|parking|special event|film"),
+    ("real_estate", "land use permits", r"land use|design review|zoning|development (permit|application)", r"map|plan\b"),
+    ("real_estate", "property sales", r"\bsales?\b|deeds?|transfers?|conveyance",
+     r"liquor|tax(able)?\b|retail|vehicle|food|ticket|cannabis|surplus"),
+    ("business", "food inspections", r"inspection|restaurant|food establishment", r"elevator|boiler|vehicle|building|fire"),
+    ("business", "business licenses", r"business licen|tax certificate|new business|business registr",
+     r"transport|vehicle|dealer|for hire|limousine|taxi|contractor|towing"),
+    ("business", "liquor license applications", r"liquor|cannabis", r"violation|enforcement|sales report|tax"),
+    ("civic", "311 service requests", r"\b311\b|service request|code (enforcement|violation|complaint)", r"summary"),
 ]
-_STALE_NAME = re.compile(r"archiv|historic|summary|statistic|totals|\bby (year|month)\b|\b(19\d\d|20[01]\d|202[0-4])\b", re.I)
+_STATE_TOPICS = {"business licenses", "liquor license applications", "property sales"}
+
+
+def stale_name(name: str) -> bool:
+    """Archived or single-year datasets; '2008-Present' style names are fine."""
+    n = re.sub(r"\b(19|20)\d\d\s*(-|–|to)\s*(present|current|now|today)\b", "", name, flags=re.I)
+    return bool(re.search(r"archiv|historic|summary|statistic|totals|\bby (year|month)\b|\b(19\d\d|20[01]\d|202[0-4])\b",
+                          n, re.I))
+
+
 _DATE_TYPES = {"calendar_date", "floating_timestamp", "fixed_timestamp", "date"}
 _GEO_TYPES = {"point", "location", "multipoint"}
 
@@ -1033,8 +1102,8 @@ def socrata_sources(place: dict, contact: str, cap: int = 12, max_age_days: int 
     fresh_after = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days)
     out: list[Source] = []
     for domain, level in portals:
-        for section, q, rule in SOCRATA_TOPICS:
-            if level == "state" and section != "business":   # statewide: licences only
+        for section, q, rule, avoid in SOCRATA_TOPICS:
+            if level == "state" and q not in _STATE_TOPICS:   # statewide: licences and sales only
                 continue
             try:
                 r = polite_get(SOCRATA_CATALOG, contact, params={"domains": domain, "only": "dataset", "q": q, "limit": 20})
@@ -1047,7 +1116,8 @@ def socrata_sources(place: dict, contact: str, cap: int = 12, max_age_days: int 
                 rs = (res.get("resource") or {}) if isinstance(res, dict) else {}
                 ds_id, name = rs.get("id", ""), rs.get("name", "")
                 if not re.fullmatch(r"[a-z0-9]{4}-[a-z0-9]{4}", ds_id or "") or not re.search(rule, name, re.I) \
-                        or _STALE_NAME.search(name) or any(s.params.get("dataset") == ds_id for s in out):
+                        or (avoid and re.search(avoid, name, re.I)) or stale_name(name) \
+                        or any(s.params.get("dataset") == ds_id for s in out):
                     continue
                 updated = _dt_any(rs.get("data_updated_at") or rs.get("updatedAt"))
                 if updated and updated < fresh_after:
@@ -1060,19 +1130,19 @@ def socrata_sources(place: dict, contact: str, cap: int = 12, max_age_days: int 
                 if not has_date:
                     continue
                 views = ((rs.get("page_views") or {}).get("page_views_total") or 0)
-                if has_geo:
+                if has_geo and level != "state":
                     kind = "socrata_geo"
-                elif level == "state" and has_area:
+                elif has_area and (place.get("postcode") or place.get("city")):
                     kind = "socrata_search"
+                elif has_geo:
+                    kind = "socrata_geo"
                 else:
                     continue
                 if best is None or views > best[0]:
                     best = (views, ds_id, name, kind)
             if best:
                 _, ds_id, name, kind = best
-                params = {"domain": domain, "dataset": ds_id}
-                if kind == "socrata_geo":
-                    params["require_date"] = True
+                params = {"domain": domain, "dataset": ds_id, "require_date": True}
                 out.append(Source(name=f"{name} ({domain})", url=f"https://{domain}/d/{ds_id}", category=section,
                                   method="api", fetcher=kind, params=params, origin="open-data catalog",
                                   notes=f"Found on the {level} open-data portal. "
@@ -1464,6 +1534,8 @@ def crawl_site(src: Source, contact: str, cutoff: dt.datetime, opts: dict) -> li
         return items
 
     items += apply_rights(items_from_structured_data(page, src, page_url, tz, "structured data"), flags, page_url)
+    if src.category == "civic" or src.origin in ("city website", "county website", "meeting software"):
+        items += apply_rights(document_items(page, page_url, src, tz), flags, page_url)
     for ics in list(dict.fromkeys(_ICS_HREF.findall(page)))[:2]:
         try:
             items += items_from_calendar(src, urllib.parse.urljoin(page_url, html.unescape(ics)), contact, tz)
@@ -1508,6 +1580,15 @@ def socrata_columns(domain: str, dataset: str, contact: str) -> tuple:
 
 # Police & fire calls: what happened, when, where — in plain words, located to the block
 CALL_PLAIN = [  # (pattern in the agency's call type, plain-English label) — first match wins
+    (r"low acuity", "Non-urgent medical or assistance call"),
+    (r"scenes? of violence", "Medical response to a violent incident"),
+    (r"\bmvi\b|motor vehicle incident", "Traffic collision"),
+    (r"rescue elevator|elevator", "Elevator rescue"),
+    (r"trans(port)? to amr|\bamr\b", "Patient taken to hospital by ambulance"),
+    (r"hang.?up", "911 hang-up — crew checked"),
+    (r"water job|water leak|flood", "Water leak or flooding"),
+    (r"fuel spill|spill", "Fuel or chemical spill"),
+    (r"out of service", "Crew investigated a reported problem"),
     (r"aid response|\baid\b|first aid", "Medical aid call"),
     (r"medic|\bems\b|medical|person down|unconscious|overdose|cardiac|breathing", "Medical emergency (paramedics)"),
     (r"car prowl|vehicle prowl|auto prowl|theft from (auto|vehicle)", "Car break-in"),
@@ -1525,7 +1606,7 @@ CALL_PLAIN = [  # (pattern in the agency's call type, plain-English label) — f
     (r"traffic stop|onview.*traffic|traffic violation", "Traffic stop"),
     (r"collision|\bmvc\b|\bmva\b|crash|accident|hit and run", "Traffic collision"),
     (r"\bdui\b|impaired", "Impaired driving"),
-    (r"fire alarm|\bafa\b|automatic alarm", "Fire alarm"),
+    (r"fire alarm|\bafa\b|automatic alarm", "Automatic fire alarm"),
     (r"(building|structure|residential|commercial|house|apartment) fire", "Building fire"),
     (r"(vehicle|car|auto) fire", "Vehicle fire"),
     (r"(brush|grass|rubbish|dumpster|trash|outside|bark) fire", "Outdoor fire"),
@@ -1565,8 +1646,8 @@ def to_block(address: str) -> str:
     a = re.sub(r"\s+", " ", str(address or "")).strip()
     m = re.match(r"^(\d+)[A-Za-z]?\s+(?!block\b|blk\b)(.+)$", a, re.I)
     if m:
-        return f"{int(m.group(1)) // 100 * 100} block of {m.group(2)}"
-    return re.sub(r"\b(\d+)\s+blk\b", r"\1 block of", a, flags=re.I)
+        return f"{int(m.group(1)) // 100 * 100} block of {name_case(m.group(2))}"
+    return name_case(re.sub(r"\b(\d+)\s+blk\b", r"\1 block of", a, flags=re.I))
 
 
 def map_link(lat: float | None, lon: float | None) -> str:
@@ -1606,12 +1687,136 @@ def describe_where(items: list[Item], points: list[tuple[str, float, float]], ma
             it.where = f"{it.where} ({near})" if it.where and near not in it.where else (it.where or near)
 
 
+# Permits, property sales, business licences and inspections: readable records, newsworthy ones first
+def _col(row: dict, cols, pattern: str, unless: str = "") -> str:
+    for c in cols:
+        if re.search(pattern, c, re.I) and not (unless and re.search(unless, c, re.I)):
+            v = row.get(c)
+            if isinstance(v, dict):                     # Socrata URL columns: {"url": ...}
+                v = v.get("url") or ""
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                return str(v).strip()
+    return ""
+
+
+def _num(value: str) -> float | None:
+    try:
+        return float(re.sub(r"[^\d.\-]", "", str(value))) if value not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def money(x: float) -> str:
+    return f"${x / 1e6:.1f}M" if x >= 1e6 else f"${x / 1e3:.0f}K" if x >= 1e4 else f"${x:,.0f}"
+
+
+def sentence(text: str, limit: int = 110) -> str:
+    t = re.sub(r"\s+", " ", str(text or "")).strip(" .;")
+    if t.isupper():
+        t = t.lower()
+    t = re.split(r"(?<=[a-z0-9\)])\.\s", t)[0]
+    t = t[:1].upper() + t[1:]
+    return t if len(t) <= limit else t[: limit - 1].rsplit(" ", 1)[0] + "…"
+
+
+_DIRS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW", "LLC", "INC", "PLLC", "LP", "USA", "WA", "US"}
+
+
+def name_case(text: str) -> str:
+    """'5432 24TH AVE NW' → '5432 24th Ave NW'; leaves mixed-case text alone."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not t.isupper():
+        return t
+    words = []
+    for w in t.split(" "):
+        core = w.strip(".,")
+        if core in _DIRS or re.fullmatch(r"\d+X+", core):
+            words.append(w)
+        elif core in ("OF", "AND", "THE", "AT", "BLOCK"):
+            words.append(w.lower())
+        elif re.fullmatch(r"\d+(ST|ND|RD|TH)", core):
+            words.append(w.lower())
+        else:
+            words.append(w.capitalize() if "/" not in w else "/".join(x.capitalize() for x in w.split("/")))
+    return " ".join(words)
+
+
+def pick_date_col(cols: dict, prefer: list) -> str | None:
+    for c in prefer or []:
+        if c in cols:
+            return c
+    dated = [c for c, t in cols.items() if t in ("calendar_date", "floating_timestamp", "fixed_timestamp", "date")]
+    good = [c for c in dated if not re.search(r"expir|end|clos|due|complet|updated|modified|created", c, re.I)]
+    for rx in (r"sale|issue|appl|start|recei|open|first|inspection|report|occur|offen[cs]e|incident|datetime|date"):
+        for c in good:
+            if re.search(rx, c, re.I):
+                return c
+    return (good or dated or [None])[0]
+
+
+_MINOR_WORK = r"re-?roof|furnace|water heater|electrical|plumbing|mechanical|solar|\bsign\b|fence|\bdeck\b|repair|" \
+              r"replace (windows|siding)|hvac|boiler|side sewer|gas piping|heat pump"
+
+
+def record_details(section: str, row: dict, cols) -> dict | None:
+    """Title, where, summary, link and a newsworthiness score for one open-data row (None = leave it out)."""
+    addr = _col(row, cols, _ADDR_COLS, unless=r"city|state|zip|postal|mail|owner|business_?street")
+    link = _col(row, cols, r"^link$|url|hyperlink")
+    link = link if link.startswith("http") else ""
+    status = _col(row, cols, r"status")
+    if section == "real_estate":
+        price = _num(_col(row, cols, r"sale_?price|price|amount|consideration", unless=r"per|tax|assess"))
+        if price is not None and _col(row, cols, r"sale|deed|transfer|grantor|grantee|excise"):
+            if price < 10_000:                     # gifts, quit-claims and other non-market transfers
+                return None
+            kind = _col(row, cols, r"property_?(type|class|use)|land_?use|prop_?type|class")
+            return {"title": f"Sold for {money(price)}" + (f": {name_case(addr)}" if addr else ""), "where": name_case(addr),
+                    "summary": " · ".join(b for b in (name_case(kind), status) if b), "url": link, "score": 2}
+        desc = (_col(row, cols, r"^description$") or _col(row, cols, r"work_?desc|project_?desc|scope|proposal")
+                or _col(row, cols, r"desc(ription)?$", unless=r"type|class|status"))
+        kind = _col(row, cols, r"permit_?type|permittype|permit_?class|permitclass|work_?class|^category$|^type$")
+        added = _num(_col(row, cols, r"units?_?added|unitsadded|new_?units|dwelling_?units|housing_?units$"))
+        removed = _num(_col(row, cols, r"units?_?removed|unitsremoved"))
+        cost = _num(_col(row, cols, r"cost|valuation|value", unless=r"per|fee"))
+        number = _col(row, cols, r"permit_?num|permitnum|record_?(id|num)|application_?num|project_?num")
+        text = f"{desc} {kind}".lower()
+        score = 0
+        score += 3 if added and added > 0 else 0
+        score += 2 if re.search(r"demoli", text) else 0
+        score += 2 if re.search(r"new (construction|building|single|townhouse|rowhouse|apartment|mixed)|"
+                                r"construct (a |an )?(new|\d)|erect|establish use", text) else 0
+        score += (2 if cost >= 1_000_000 else 1 if cost >= 250_000 else 0) if cost else 0
+        score += 1 if re.search(r"mixed.use|apartment|townhouse|rowhouse|\badu\b|accessory dwelling|restaurant|retail|"
+                                r"school|park|change of use|grocery|cafe|brewery|daycare|child care", text) else 0
+        score -= 2 if re.search(_MINOR_WORK, text) else 0
+        bits = [f"adds {added:g} home{'s' if added != 1 else ''}" if added and added > 0 else "",
+                f"removes {removed:g}" if removed and removed > 0 else "",
+                f"est. cost {money(cost)}" if cost else "", f"status: {status.lower()}" if status else "",
+                name_case(kind) if kind and desc else "", f"permit {number}" if number else ""]
+        return {"title": sentence(desc) or name_case(kind) or "Building permit", "where": name_case(addr),
+                "summary": " · ".join(b for b in bits if b), "url": link, "score": score}
+    if section == "business":
+        if status and re.search(r"expired|terminat|closed|inactive|revoked|cancel|discontinu|surrender|withdrawn", status, re.I):
+            return None
+        name = _col(row, cols, r"trade_?name|tradename|\bdba\b|doing_?business|business_?name|establishment|"
+                               r"program_?identifier|^name$|licensee")
+        kind = _col(row, cols, r"licen[cs]e_?(type|desc)|privilege|naics_?desc|business_?type|activity|^description$")
+        result = _col(row, cols, r"inspection_?result|^result$|grade|violation_?desc")
+        score_ = _col(row, cols, r"inspection_?score|^score$")
+        bits = [name_case(kind), f"result: {result.lower()}" if result else "", f"score {score_}" if score_ else "",
+                f"status: {status.lower()}" if status else ""]
+        return {"title": name_case(name) or name_case(kind) or "Business record", "where": name_case(addr),
+                "summary": " · ".join(b for b in bits if b), "url": link,
+                "score": 2 if re.search(r"new|pending|appl|issued|active", status or "new", re.I) else 1}
+    title = sentence(_col(row, cols, r"type|description|name|subject|category")) or "Record"
+    return {"title": title, "where": name_case(addr), "summary": status, "url": link, "score": 1}
+
+
 def api_socrata_geo(src, place, contact, cutoff, opts):
     """Any Socrata dataset: finds its date and location columns, filters to the radius and window."""
     p = src.params
     cols = dict(socrata_columns(p["domain"], p["dataset"], contact))
-    date_col = next((c for c in p.get("date_fields", []) if c in cols), None) or \
-        next((c for c, t in cols.items() if t in ("calendar_date", "floating_timestamp")), None)
+    date_col = pick_date_col(cols, p.get("date_fields", []))
     if p.get("require_date") and not date_col:
         raise ValueError("this dataset has no date column")
     point_col = next((c for c, t in cols.items() if t in ("point", "location")), None)
@@ -1640,8 +1845,7 @@ def api_socrata_geo(src, place, contact, cutoff, opts):
         server_geo = False
     r.raise_for_status()
 
-    titles = p.get("title_fields") or [c for c in cols if re.search(r"type|description|name", c)]
-    out = []
+    out, rank = [], {}
     for row in r.json():
         dist = lat = lon = None
         if lat_col and lon_col:
@@ -1671,59 +1875,261 @@ def api_socrata_geo(src, place, contact, cutoff, opts):
                             summary=" · ".join(b for b in bits if b), via=src.name, found_by="api", lat=lat, lon=lon,
                             where=d["block"] or "", map_url=map_link(lat, lon)))
         else:
-            address = pick(row, p.get("address_fields", []))
-            bits = [b for b in (f"{dist:.1f} km from the centre" if dist is not None else "", extra) if b]
-            out.append(Item(source=src.name, section=src.category,
-                            title=" — ".join(b for b in (pick(row, titles, "Record"), address) if b),
-                            url=src.url, published=when, summary=" · ".join(bits), via=src.name, found_by="api",
-                            lat=lat, lon=lon, where=address))
-        if len(out) >= opts["limit"]:
+            d = record_details(src.category, row, cols)
+            if d is None or (src.category == "real_estate" and d["score"] < 1):   # routine repairs etc.
+                continue
+            if p.get("title_fields"):
+                d["title"] = pick(row, p["title_fields"]) or d["title"]
+            where_ = pick(row, p.get("address_fields", [])) or d["where"]
+            out.append(Item(source=src.name, section=src.category, title=d["title"], url=d["url"] or src.url,
+                            published=when, summary=" · ".join(b for b in (d["summary"], extra) if b), via=src.name,
+                            found_by="api", lat=lat, lon=lon, where=where_, score=None,
+                            map_url=map_link(lat, lon) if src.category == "real_estate" else ""))
+            rank[id(out[-1])] = d["score"]
+        if len(out) >= opts["limit"] * (4 if rank else 1):
             break
-    return out
+    if rank:   # most newsworthy first: new homes, demolitions, big projects
+        out.sort(key=lambda i: (rank.get(id(i), 0), i.published or dt.datetime.min.replace(tzinfo=dt.timezone.utc)),
+                 reverse=True)
+    return out[: opts["limit"]]
 
 
 def api_socrata_search(src, place, contact, cutoff, opts):
+    """Datasets without coordinates (e.g. statewide licences or county sales): searched by ZIP code, recent rows only."""
+    p = src.params
+    cols = dict(socrata_columns(p["domain"], p["dataset"], contact))
+    date_col = pick_date_col(cols, p.get("date_fields", []))
+    if p.get("require_date") and not date_col:
+        raise ValueError("this dataset has no date column")
     term = place.get("postcode") or place.get("city") or place["label"]
-    url = f"https://{src.params['domain']}/resource/{src.params['dataset']}.json"
-    r = polite_get(url, contact, params={"$q": term, "$limit": opts["limit"]})
+    params = {"$q": term, "$limit": min(opts["limit"] * 5, 1000)}
+    if date_col:
+        since = cutoff.astimezone(ZoneInfo(opts["tz"])).strftime("%Y-%m-%dT%H:%M:%S")
+        params["$where"], params["$order"] = f"{date_col} > '{since}'", f"{date_col} DESC"
+    url = f"https://{p['domain']}/resource/{p['dataset']}.json"
+    r = polite_get(url, contact, params=params)
+    if r.status_code == 400 and "$where" in params:
+        params.pop("$where"), params.pop("$order", None)
+        r = polite_get(url, contact, params=params)
     r.raise_for_status()
     out = []
     for row in r.json():
-        title = pick(row, ["tradename", "trade_name", "business_name", "dba", "licensee", "name"], "Record")
-        detail = ", ".join(f"{k}: {v}" for k, v in row.items()
-                           if isinstance(v, str) and len(v) < 80 and not k.startswith(":"))
-        out.append(Item(source=src.name, section=src.category, title=title, url=src.url,
-                        summary=clean(detail, 400), via=src.name, found_by="api"))
+        if "title_fields" in p:                                   # curated sources keep their own fields
+            d = {"title": pick(row, p["title_fields"], "Record"), "where": "", "url": "", "score": 1, "summary": ""}
+        else:
+            d = record_details(src.category, row, cols)
+        if d is None:
+            continue
+        out.append(Item(source=src.name, section=src.category, title=d["title"], url=d["url"] or src.url,
+                        published=parse_date(row.get(date_col), opts["tz"]) if date_col else None,
+                        summary=d["summary"], where=d["where"], via=src.name, found_by="api"))
     return out
 
 
+# Council & board meetings: every agenda item, its vote, and its attached documents
+_PROCEDURAL = re.compile(
+    r"^\s*(\d+[\.\)]\s*)?(call to order|roll call|approval of (the )?(agenda|minutes|journal)|adjourn|public comment|"
+    r"items? of business|presentations?\s*$|executive session|consent (calendar|agenda)\s*$|reports? of (the )?(chair|president)|"
+    r"payment of (the )?bills|introduction and referral|preliminary items|other business|announcements?|pledge|"
+    r"chair'?s report|briefings?\s*$|council president'?s report|land acknowledg|approval of the journal)", re.I)
+PUBLIC_RECORD = "public record — facts free to report"
+
+
+def agenda_headline(title: str, matter_type: str = "", matter_name: str = "") -> str:
+    """'AN ORDINANCE relating to land use and zoning; amending … 5601 24th Ave NW …' →
+    'Ordinance: Land use and zoning — 5601 24th Ave NW'."""
+    t = clean(title, 3000)
+    kind = re.sub(r"\s*\(.*?\)\s*", " ", matter_type or "").strip()
+    m = re.search(r"\brelating to\s+(.+?)(?:;|:|\.\s|$)", t, re.I)
+    subject = re.sub(r"^the\s+", "", m.group(1).strip(" ,"), flags=re.I) if m else ""
+    if subject:
+        head = f"{kind or 'Legislation'}: {sentence(subject, 90)}"
+    else:
+        head = sentence(matter_name if matter_name and len(matter_name) > 12 else t, 110)
+    addr = _ADDRESS.search(t)
+    if addr and addr.group(0).strip().lower() not in head.lower():
+        head += f" — {addr.group(0).strip()}"
+    return head
+
+
 def api_legistar(src, place, contact, cutoff, opts):
+    client, tz = src.params["client"], opts["tz"]
+    base = f"https://webapi.legistar.com/v1/{client}"
     params = {"$filter": f"EventDate ge datetime'{cutoff.date().isoformat()}'",
               "$orderby": "EventDate desc", "$top": opts["limit"]}
-    r = polite_get(f"https://webapi.legistar.com/v1/{src.params['client']}/events", contact, params=params)
+    r = polite_get(f"{base}/events", contact, params=params)
     r.raise_for_status()
+    events = [ev for ev in r.json() if isinstance(ev, dict)]
+    now = dt.datetime.now(dt.timezone.utc)
     out = []
-    for ev in r.json():
+    for ev in events:
         agenda = "agenda posted" if ev.get("EventAgendaFile") else "agenda not posted yet"
+        docs = [(n, ev.get(k)) for n, k in (("Agenda", "EventAgendaFile"), ("Minutes", "EventMinutesFile"))
+                if str(ev.get(k) or "").startswith("http")]
+        when = parse_date(ev.get("EventDate"), tz)
+        past = bool(when and when < now - dt.timedelta(hours=12))
         out.append(Item(source=src.name, section="civic", title=f"{ev.get('EventBodyName', 'Meeting')} meeting",
                         url=ev.get("EventInSiteURL") or ev.get("EventAgendaFile") or src.url,
-                        starts=parse_date(ev.get("EventDate"), opts["tz"]), where=clean(ev.get("EventLocation") or "", 160),
-                        summary=clean(f"{ev.get('EventTime') or ''} · {agenda}", 300), via=src.name, found_by="api"))
+                        starts=None if past else when, published=when if past else None,
+                        where=clean(ev.get("EventLocation") or "", 160),
+                        summary=clean(f"{ev.get('EventTime') or ''} · {agenda}" + (" · minutes posted" if len(docs) > 1 else ""), 300),
+                        via=src.name, found_by="api", attachments=docs, use=PUBLIC_RECORD))
+
+    # Open the agendas of the meetings closest to today: each item is a possible story
+    deep = sorted((ev for ev in events if ev.get("EventId")),
+                  key=lambda ev: abs(((parse_date(ev.get("EventDate"), tz) or now) - now).total_seconds()))
+    for ev in deep[: opts.get("agenda_events", 10)]:
+        try:
+            rr = polite_get(f"{base}/events/{ev['EventId']}/eventitems", contact,
+                            params={"AgendaNote": 1, "MinutesNote": 1, "Attachments": 1})
+        except httpx.HTTPError:
+            continue
+        rows = _json_ok(rr)
+        when = parse_date(ev.get("EventDate"), tz)
+        body = ev.get("EventBodyName") or "council"
+        day = f"{when:%a} {when.day} {when:%b}" if when else "a date not listed"
+        for ei in rows if isinstance(rows, list) else []:
+            title = str(ei.get("EventItemTitle") or "").strip()
+            if len(title) < 15 or (_PROCEDURAL.match(title) and not ei.get("EventItemMatterId")):
+                continue
+            action = " ".join(str(x) for x in (ei.get("EventItemActionName"), ei.get("EventItemTally")) if x)
+            if when and when < now:
+                lead = f"{action.capitalize()} at the {body} meeting on {day}" if action else \
+                    f"Taken up at the {body} meeting on {day}"
+            else:
+                lead = f"On the agenda for the {body} meeting on {day}"
+            mid, guid = ei.get("EventItemMatterId"), ei.get("EventItemMatterGuid")
+            url = (f"https://{client}.legistar.com/LegislationDetail.aspx?ID={mid}&GUID={guid}" if mid and guid
+                   else ev.get("EventInSiteURL") or src.url)
+            note = clean(ei.get("EventItemMinutesNote") or ei.get("EventItemAgendaNote") or "", 300)
+            atts = [(clean(a.get("MatterAttachmentName") or "Attachment", 120), a.get("MatterAttachmentHyperlink"))
+                    for a in ei.get("EventItemMatterAttachments") or []
+                    if isinstance(a, dict) and str(a.get("MatterAttachmentHyperlink") or "").startswith("http")]
+            out.append(Item(source=src.name, section="civic", url=url, published=when, via=src.name, found_by="agenda",
+                            title=agenda_headline(title, ei.get("EventItemMatterType") or "", ei.get("EventItemMatterName") or ""),
+                            summary=" · ".join(b for b in (lead, ei.get("EventItemMatterFile") or "", note,
+                                                           f"Full title: {clean(title, 700)}") if b),
+                            attachments=atts[:6], use=PUBLIC_RECORD))
     return out
 
 
 def api_civicclerk(src, place, contact, cutoff, opts):
-    url = f"https://{src.params['tenant']}.api.civicclerk.com/v1/Events"
+    tenant = src.params["tenant"]
+    url = f"https://{tenant}.api.civicclerk.com/v1/Events"
     r = polite_get(url, contact, params={"$orderby": "startDateTime desc", "$top": opts["limit"]})
     if r.status_code == 400:
         r = polite_get(url, contact)
     r.raise_for_status()
     data = r.json()
     rows = data.get("value", []) if isinstance(data, dict) else data
-    return [Item(source=src.name, section="civic", title=pick(ev, ["eventName", "name", "title", "categoryName"], "Meeting"),
-                 url=src.url, starts=parse_date(pick(ev, ["startDateTime", "eventDate", "date"]), opts["tz"]),
-                 summary=clean(pick(ev, ["eventDescription", "description", "location"]), 300),
-                 via=src.name, found_by="api") for ev in rows]
+    out = []
+    for ev in rows if isinstance(rows, list) else []:
+        docs = []
+        for f in ev.get("publishedFiles") or []:     # agenda / minutes / packet (field names not vendor-documented)
+            if not isinstance(f, dict):
+                continue
+            fid = f.get("fileId") or f.get("id")
+            link = f.get("url") or (f"https://{tenant}.api.civicclerk.com/v1/Meetings/GetMeetingFileStream"
+                                    f"(fileId={fid},plainText=false)" if fid else "")
+            if str(link).startswith("http"):
+                docs.append((clean(str(f.get("name") or f.get("type") or "Document"), 120), link))
+        out.append(Item(source=src.name, section="civic",
+                        title=pick(ev, ["eventName", "name", "title", "categoryName"], "Meeting"),
+                        url=src.url, starts=parse_date(pick(ev, ["startDateTime", "eventDate", "date"]), opts["tz"]),
+                        summary=clean(pick(ev, ["eventDescription", "description", "location"]), 300),
+                        via=src.name, found_by="api", attachments=docs[:6], use=PUBLIC_RECORD))
+    return out
+
+
+# Documents: PDFs of agendas, minutes, staff reports and notices, read for mentions of the place
+PDF_MAX_BYTES, PDF_MAX_PAGES = 15_000_000, 60
+_DOC_LINK = re.compile(r"<a\b[^>]*href=[\"']([^\"'#]+)[\"'][^>]*>(.*?)</a>", re.I | re.S)
+_DOC_HREF = re.compile(r"\.pdf($|\?)|/AgendaCenter/ViewFile/|View\.ashx|DocumentCenter/View|GetMeetingFileStream", re.I)
+_DOC_WORDS = re.compile(r"agenda|minutes|packet|notice|hearing|staff report|report|ordinance|resolution|plan|budget", re.I)
+_MONTHS = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+
+
+def date_in(text: str, tz: str) -> dt.datetime | None:
+    """A date written in a link or file name: 2026-10-27, 10/27/2026, Oct 27, 2026, or CivicPlus _10272026."""
+    t = text or ""
+    for rx, order in ((r"(20\d\d)-(\d{1,2})-(\d{1,2})", "ymd"), (r"(\d{1,2})/(\d{1,2})/(20\d\d)", "mdy"),
+                      (r"_(\d{2})(\d{2})(20\d\d)\b", "mdy")):
+        if m := re.search(rx, t):
+            a, b, c = (int(x) for x in m.groups())
+            y, mo, d = (a, b, c) if order == "ymd" else (c, a, b)
+            try:
+                return dt.datetime(y, mo, d, tzinfo=ZoneInfo(tz))
+            except ValueError:
+                pass
+    if m := re.search(rf"\b({_MONTHS})[a-z]*\.?[\s\-_]+(\d{{1,2}}),?[\s\-_]+(20\d\d)", t, re.I):
+        try:
+            return dt.datetime.strptime(f"{m.group(1)[:3].title()} {m.group(2)} {m.group(3)}", "%b %d %Y") \
+                .replace(tzinfo=ZoneInfo(tz))
+        except ValueError:
+            pass
+    return None
+
+
+def document_items(page_html: str, page_url: str, src: Source, tz: str, cap: int = 10) -> list[Item]:
+    """Agenda, minutes and report PDFs linked from a government page, with the date in their name."""
+    out, seen = [], set()
+    for href, text in _DOC_LINK.findall(page_html):
+        url = urllib.parse.urljoin(page_url, html.unescape(href))
+        label = clean(text, 160) or urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1])
+        if url in seen or not _DOC_HREF.search(url) or not (_DOC_WORDS.search(label) or _DOC_WORDS.search(url)):
+            continue
+        when = date_in(f"{label} {url}", tz)
+        if not when:                       # undated documents could be years old — leave them out
+            continue
+        seen.add(url)
+        out.append(Item(source=src.name, section="civic", title=sentence(label, 120), url=url, published=when,
+                        summary=f"Document posted by {src.name}", via=src.name, found_by="document",
+                        attachments=[(sentence(label, 80), url)], use=PUBLIC_RECORD, jurisdiction=src.jurisdiction))
+        if len(out) >= cap:
+            break
+    return out
+
+
+@functools.lru_cache(maxsize=512)
+def pdf_text(url: str, contact: str) -> str:
+    """Text of a public PDF (robots.txt and opt-outs respected; size and page caps)."""
+    if pypdf is None:
+        return ""
+    try:
+        r = web_get(url, contact)
+    except httpx.HTTPError:
+        return ""
+    data = r.content
+    if r.status_code != 200 or len(data) > PDF_MAX_BYTES or not data.lstrip()[:5] == b"%PDF-":
+        return ""
+    if rights_action(page_rights(r, "", contact)) != "ok":
+        return ""
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        text = "\n".join((pg.extract_text() or "") for pg in reader.pages[:PDF_MAX_PAGES])
+    except Exception:
+        return ""
+    return re.sub(r"[ \t]+", " ", text)[:300_000]
+
+
+def snippet_around(text: str, start: int, end: int, width: int = 200, drop: str = "") -> str:
+    """The sentence around a match (or a window of text when sentences run long)."""
+    a = text.rfind(".", max(0, start - width), start)
+    b = text.find(".", end, end + width)
+    if a != -1 and b != -1:
+        s = re.sub(r"\s+", " ", text[a + 1: b + 1]).strip()
+        if drop and s.lower().startswith(drop.lower()):
+            s = s[len(drop):].strip(" :-")
+        return s
+    a, b = max(0, start - width), min(len(text), end + width)
+    s = re.sub(r"\s+", " ", text[a:b]).strip()
+    if drop and s.lower().startswith(drop.lower()):
+        s, a = s[len(drop):].strip(" :-"), 0
+    if a > 0:
+        s = "…" + s.split(" ", 1)[-1]
+    if b < len(text):
+        s = s.rsplit(" ", 1)[0] + "…"
+    return s
 
 
 API_FETCHERS = {
@@ -1774,7 +2180,8 @@ def fetch_source(src: Source, place: dict, contact: str, cutoff: dt.datetime, op
     now = dt.datetime.now(dt.timezone.utc)
     seen, kept = set(), []
     for it in items:
-        key = it.url if it.found_by != "api" else (it.title, it.published, it.starts, it.summary)
+        key = (it.url if it.found_by not in ("api", "agenda") else
+               (it.url, it.title) if it.found_by == "agenda" else (it.title, it.published, it.starts, it.summary))
         if not it.title or key in seen or not in_window(it, cutoff, now, opts["days_ahead"]):
             continue
         seen.add(key)
@@ -1784,7 +2191,7 @@ def fetch_source(src: Source, place: dict, contact: str, cutoff: dt.datetime, op
             it.use = ("public record — facts free to report" if it.found_by == "api"
                       else "their writing — link, and rewrite facts in your own words")
         kept.append(it)
-    kept = kept[: opts["limit"]]
+    kept = kept[: opts["limit"] * (8 if src.fetcher in ("legistar", "civicclerk") else 1)]  # agenda items
     src.n_items = len(kept)
     src.rules = rules_for(src)
     if kept:
@@ -1875,7 +2282,7 @@ def _reach_m(place: dict, radius_km: float) -> int:
 
 @st.cache_data(ttl=7 * 86400, show_spinner=False)
 def _overpass_names(lat: float, lon: float, reach_m: int, contact: str) -> list[tuple[str, float, float]]:
-    query = f"""[out:json][timeout:25];
+    query = f"""[out:json][timeout:60];
 (
   nwr(around:{reach_m},{lat},{lon})["name"]["amenity"~"^(school|college|library|community_centre|marketplace|theatre|arts_centre|townhall|cinema)$"];
   nwr(around:{reach_m},{lat},{lon})["name"]["leisure"~"^(park|playground|sports_centre|stadium|marina|nature_reserve|garden)$"];
@@ -1883,10 +2290,8 @@ def _overpass_names(lat: float, lon: float, reach_m: int, contact: str) -> list[
   nwr(around:{reach_m},{lat},{lon})["name"]["place"~"^(neighbourhood|quarter|suburb|locality)$"];
 );
 out tags center 600;"""
-    r = polite_get("https://overpass-api.de/api/interpreter", contact, params={"data": query})
-    r.raise_for_status()
     out = []
-    for el in r.json().get("elements", []):
+    for el in overpass(query, contact).get("elements", []):
         pt = el.get("center") or el
         if "lat" in pt and "lon" in pt and el.get("tags", {}).get("name"):
             out.append((el["tags"]["name"], float(pt["lat"]), float(pt["lon"])))
@@ -1992,6 +2397,38 @@ def localize(items: list[Item], place: dict, contact: str, opts: dict, landmarks
                 it.body = body
         stats["articles read"] = len(to_read)
         pending = run(pending)
+
+    # Read attached documents (agenda items' staff reports, agendas, minutes) for the place or its landmarks
+    jobs = []
+    civic_words = r"land use|zoning|rezone|park|street|transport|transit|school|library|housing|permit|development|" \
+                  r"levy|budget|neighbo|bridge|sidewalk|bike|bus|traffic|community"
+    with_docs = sorted((it for it in pending if it.attachments),
+                       key=lambda it: (not re.search(civic_words, f"{it.title} {it.summary}", re.I),
+                                       it.found_by != "agenda"))
+    for it in with_docs:
+        for name, url in it.attachments[:3]:
+            jobs.append((it, name, url))
+    jobs = jobs[: opts.get("pdf_checks", 0)]
+    if jobs:
+        with cf.ThreadPoolExecutor(max_workers=4) as pool:
+            texts = list(pool.map(lambda j: pdf_text(j[2], contact), jobs))
+        stats["documents read"] = sum(1 for t in texts if t)
+        for (it, name, url), text in zip(jobs, texts):
+            if not text or it.local:
+                continue
+            for pattern, tier in ((ctx["names"], "name"), (ctx["marks"], "landmark")):
+                m = pattern.search(text) if pattern is not None else None
+                if m:
+                    it.local, it.local_tier = True, tier
+                    it.local_why = (f"“{name}” names “{m.group(0)}”" if tier == "name"
+                                    else f"“{name}” mentions {m.group(0)}, which is in {place['label']}")
+                    quote = f"From “{name}”: “{snippet_around(text, m.start(), m.end(), drop=name)}”"
+                    lead, _, rest = it.summary.partition(" · ")   # keep the vote / meeting date first
+                    it.summary = " · ".join(x for x in (lead, quote, rest) if x)
+                    stats[tier] += 1
+                    stats["found in documents"] += 1
+                    break
+        pending = [it for it in pending if not it.local]
 
     # Look up street addresses and keep the item if one falls inside the boundary
     looked = 0
@@ -2209,7 +2646,8 @@ def build_newsletter(place: dict, items: list[Item], tz: str, days: int, days_ah
         out.append(f"<h2>{e(SECTIONS[s])}</h2>")
         if s == "public_safety":
             out.append('<p class="nb-note">What was reported, when and where. Calls for service are reports, '
-                       'not confirmed crimes; locations are shown to the block.</p><ul class="nb-blotter">')
+                       'not confirmed crimes; locations are shown to the block. Fire &amp; medical data lists only the '
+                       'type of response — patient details are private by law.</p><ul class="nb-blotter">')
             for en in lst[:12]:
                 calls = en.members or [en.item]
                 count = f" · {len(calls)} calls" if len(calls) > 1 else ""
@@ -2234,7 +2672,7 @@ def build_newsletter(place: dict, items: list[Item], tz: str, days: int, days_ah
         for en in lst[:8]:
             it = en.item
             when = it.published.astimezone(zone).strftime("%d %b") if it.published else ""
-            text = it.blurb or clean(it.summary, 240)
+            text = it.blurb or clean(re.sub(r" · Full title: .*$", "", it.summary), 380 if s == "civic" else 240)
             meta = " · ".join(x for x in (it.source, when) if x)
             out.append(f'<div class="nb-story"><a class="nb-head" href="{_href(it.url)}" target="_blank">{e(en.title)}</a>'
                        + (f"<p>{e(text)}</p>" if text else "")
@@ -2336,6 +2774,9 @@ def main() -> None:
         pages_per_source = st.slider("Pages to open per site", 0, 40, 12, disabled=not deep,
                                      help="Each page is fetched politely, so more pages = slower.")
         limit = st.slider("Max items kept per source", 10, 100, 40)
+        agenda_events = st.slider("Council meetings to open (agenda items, votes, attachments)", 0, 30, 10)
+        pdf_checks = st.slider("Documents (PDFs) to read for the place", 0, 100, 30, disabled=pypdf is None,
+                               help="Agendas, minutes and staff reports attached to meetings. Needs the pypdf package.")
         full_text = st.checkbox("Extract full text (slower)", False, disabled=trafilatura is None)
         full_text_n = st.slider("Full text: pages per site", 1, 10, 3, disabled=not full_text)
 
@@ -2414,7 +2855,7 @@ def main() -> None:
 
         opts = {"limit": limit, "radius_km": radius_km, "full_text": full_text, "full_text_n": full_text_n,
                 "deep": deep, "pages_per_source": pages_per_source if deep else 0,
-                "days_ahead": days_ahead, "tz": tz}
+                "days_ahead": days_ahead, "tz": tz, "agenda_events": agenda_events}
         def crawl(batch: list[Source], label: str) -> list[Item]:
             got: list[Item] = []
             progress = st.progress(0.0, text=label)
@@ -2452,6 +2893,7 @@ def main() -> None:
             except Exception as e:
                 notes.append(f"Landmark lookup skipped: {type(e).__name__}: {str(e)[:120]}")
         lopts = {"locality_km": locality_km, "body_checks": body_checks, "address_checks": address_checks,
+                 "pdf_checks": pdf_checks,
                  "trust_search": trust_search,
                  "extra_names": [n.strip() for n in extra_names.split(",") if n.strip()]}
         with st.spinner(f"Checking which items are really about {place['label']}…"):
@@ -2498,6 +2940,8 @@ def main() -> None:
             st.caption("Why items were kept: " + " · ".join(f"{label} {lstats[k]}" for k, label in tiers if lstats.get(k))
                        + f"  |  articles read: {lstats.get('articles read', 0)}"
                        + f" · addresses looked up: {lstats.get('addresses looked up', 0)}"
+                       + f" · documents read: {lstats.get('documents read', 0)}"
+                       + f" (place found in {lstats.get('found in documents', 0)})"
                        + f" · repeated headlines merged: {merged}")
         st.html(build_newsletter(place, items, tz, result.get("days", 7), result.get("days_ahead", 30), lstats))
         dropped = [i for i in items if i.local is False]
